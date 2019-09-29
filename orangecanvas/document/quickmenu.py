@@ -280,12 +280,6 @@ class MenuPage(ToolTree):
             else:
                 height = 0
 
-            # add scrollbar width
-            scroll = self.view().verticalScrollBar()
-            isTransient = scroll.style().styleHint(QStyle.SH_ScrollBar_Transient, widget=scroll)
-            if not isTransient:
-                width += scroll.style().pixelMetric(QStyle.PM_ScrollBarExtent, widget=scroll)
-
             self.__sizeHint = QSize(width, height)
 
         return self.__sizeHint
@@ -545,6 +539,18 @@ class MenuStackWidget(QStackedWidget):
     """
     Stack widget for the menu pages.
     """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.__isScrollbarTransient = True
+
+    def updateScrollbarState(self):
+        if self.count() == 0:
+            return
+        scroll = self.widget(0).view().verticalScrollBar()
+        isTransient = scroll.style().styleHint(QStyle.SH_ScrollBar_Transient, widget=scroll)
+        if self.__isScrollbarTransient is not isTransient:
+            self.__isScrollbarTransient = isTransient
+            self.updateGeometry()
 
     def sizeHint(self):
         # type: () -> QSize
@@ -560,11 +566,13 @@ class MenuStackWidget(QStackedWidget):
 
         width = max([s.width() for s in widget_hints])
 
-        if widget_hints:
-            # Take the median for the height
-            height = statistics.median([s.height() for s in widget_hints])
-        else:
-            height = default_size.height()
+        # add scrollbar width
+        if self.count() != 0 and not self.__isScrollbarTransient:
+            scroll = self.widget(0).view().verticalScrollBar()
+            width += scroll.style().pixelMetric(QStyle.PM_ScrollBarExtent, widget=scroll)
+
+        # Take the median for the height
+        height = statistics.median([s.height() for s in widget_hints])
         return QSize(width, int(height))
 
     def __sizeHintForTreeView(self, view):
@@ -1159,6 +1167,9 @@ class PagedMenu(QWidget):
         """
         return self.__tab.button(index)
 
+    def updateScrollbarState(self):
+        self.__stack.updateScrollbarState()
+
     def update_from_settings(self):
         settings = QSettings()
         showCategories = settings.value("quickmenu/show-categories", False, bool)
@@ -1503,12 +1514,13 @@ class QuickMenu(FramelessWindow):
 
         UsageStatistics.set_last_search_query(searchText)
 
+        self.__pages.updateScrollbarState()
+
         self.ensurePolished()
 
+        size = self.sizeHint()
         if self.testAttribute(Qt.WA_Resized) and self.sizeGripEnabled():
-            size = self.size()
-        else:
-            size = self.sizeHint()
+            size.setHeight(self.size().height())
 
         desktop = QApplication.desktop()
         screen_geom = desktop.availableGeometry(pos)
