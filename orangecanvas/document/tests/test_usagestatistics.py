@@ -44,7 +44,7 @@ class TestLinksEditDialog(TestMainWindowBase):
                         [
                             {
                                 'Type': EventType.NodeAdd,
-                                'Widget Name': w_desc.name,
+                                'Widget Name': w_desc.id,
                                 'Widget': 0
                             }
                         ]
