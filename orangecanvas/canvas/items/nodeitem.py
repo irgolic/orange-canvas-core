@@ -11,7 +11,7 @@ from operator import attrgetter
 from itertools import groupby
 from xml.sax.saxutils import escape
 
-from typing import Dict, Any, Optional, List, Iterable, Tuple
+from typing import Dict, Any, Optional, List, Iterable, Tuple, Union
 
 from AnyQt.QtWidgets import (
     QGraphicsItem, QGraphicsObject, QGraphicsWidget,
@@ -25,8 +25,8 @@ from AnyQt.QtGui import (
 )
 from AnyQt.QtCore import (
     Qt, QEvent, QPointF, QRectF, QRect, QSize, QTime, QTimer,
-    QPropertyAnimation, QEasingCurve, QObject, QVariantAnimation
-)
+    QPropertyAnimation, QEasingCurve, QObject, QVariantAnimation,
+    QParallelAnimationGroup)
 from AnyQt.QtCore import pyqtSignal as Signal, pyqtProperty as Property
 
 from .graphicspathobject import GraphicsPathObject
@@ -34,7 +34,8 @@ from .graphicstextitem import GraphicsTextItem
 from .utils import saturated, radial_gradient
 
 from ...scheme.node import UserMessage
-from ...registry import NAMED_COLORS, WidgetDescription, CategoryDescription
+from ...registry import NAMED_COLORS, WidgetDescription, CategoryDescription, InputSignal, \
+    OutputSignal
 from ...resources import icon_loader
 from .utils import uniform_linear_layout_trunc
 from ...utils import set_flag
@@ -430,7 +431,11 @@ class AnchorPoint(QGraphicsObject):
         self.setFlag(QGraphicsItem.ItemHasNoContents, True)
         self.indicator = LinkAnchorIndicator(self)
 
+        self.channel = None  # type: Optional[Union[InputSignal, OutputSignal]]
         self.__direction = QPointF()
+
+        self.anim = QPropertyAnimation(self, b'pos', self)
+        self.anim.setDuration(50)
 
     def anchorScenePos(self):
         # type: () -> QPointF
@@ -501,7 +506,10 @@ class NodeAnchorItem(GraphicsPathObject):
 
         self.__anchorPath = QPainterPath()
         self.__points = []  # type: List[AnchorPoint]
-        self.__pointPositions = []  # type: List[float]
+        self.__uniformPointPositions = []  # type: List[float]
+        self.__channelPointPositions = []  # type: List[float]
+        self.__signals = []  # type: List[Union[InputSignal, OutputSignal]]
+        self.__lastSetPointPositions = []  # type: List[float]
 
         self.__fullStroke = QPainterPath()
         self.__dottedStroke = QPainterPath()
@@ -526,6 +534,12 @@ class NodeAnchorItem(GraphicsPathObject):
         self.__blurAnimation.setDuration(50)
         self.__blurAnimation.finished.connect(self.__on_finished)
 
+        self.animGroup = QParallelAnimationGroup()
+
+    def setSignals(self, signals):
+        self.__signals = signals
+        self.setAnchorPath(self.__anchorPath)
+
     def parentNodeItem(self):
         # type: () -> Optional['NodeItem']
         """
@@ -548,6 +562,17 @@ class NodeAnchorItem(GraphicsPathObject):
         stroke_path.setWidth(25)
         self.prepareGeometryChange()
         self.__shape = stroke_path.createStroke(path)
+        stroke_path.setWidth(3)
+
+        # Match up dash patterns for animations
+        dash6 = drawDashPattern(6)
+        channelAnchor = drawDashPattern(len(self.__signals) or 1)
+        fullAnchor = drawDashPattern(1)
+        dash6, channelAnchor = matchDashPattern(dash6, channelAnchor)
+        channelAnchor, fullAnchor = matchDashPattern(channelAnchor, fullAnchor)
+        self.__unanchoredDash = np.array(dash6)
+        self.__channelDash = np.array(channelAnchor)
+        self.__anchoredDash = np.array(fullAnchor)
 
         # The full stroke
         stroke_path.setWidth(3)
@@ -586,17 +611,12 @@ class NodeAnchorItem(GraphicsPathObject):
         """
         self.anchored = anchored
         if anchored:
-            self.setPath(self.__fullStroke)
-            self.__shadow.setPath(self.__fullStroke)
             self.shadow.setEnabled(False)
-            self.__hover = False
-            self.__updateHoverState()
             self.setBrush(self.connectedBrush)
         else:
-            self.setPath(self.__dottedStroke)
-            self.__shadow.setPath(self.__dottedStroke)
             brush = self.normalHoverBrush if self.__hover else self.normalBrush
             self.setBrush(brush)
+        self.__updatePositions()
 
     def setConnectionHint(self, hint=None):
         """
@@ -638,7 +658,10 @@ class NodeAnchorItem(GraphicsPathObject):
             raise ValueError("%s already added." % anchor)
 
         self.__points.insert(index, anchor)
-        self.__pointPositions.insert(index, 0)  # set in __updatePositions
+        self.__uniformPointPositions.insert(index, 0)
+        cperc = self.__getChannelPercent(anchor.channel)
+        self.__channelPointPositions.insert(index, cperc)
+        self.animGroup.addAnimation(anchor.anim)
 
         anchor.setParentItem(self)
         anchor.destroyed.connect(self.__onAnchorDestroyed)
@@ -666,6 +689,7 @@ class NodeAnchorItem(GraphicsPathObject):
         Remove and delete the anchor point.
         """
         anchor = self.takeAnchor(anchor)
+        self.animGroup.removeAnimation(anchor.anim)
 
         anchor.hide()
         anchor.setParentItem(None)
@@ -683,7 +707,8 @@ class NodeAnchorItem(GraphicsPathObject):
         index = self.__points.index(anchor)
 
         del self.__points[index]
-        del self.__pointPositions[index]
+        del self.__uniformPointPositions[index]
+        del self.__channelPointPositions[index]
 
         anchor.destroyed.disconnect(self.__onAnchorDestroyed)
 
@@ -701,7 +726,8 @@ class NodeAnchorItem(GraphicsPathObject):
             return
 
         del self.__points[index]
-        del self.__pointPositions[index]
+        del self.__uniformPointPositions[index]
+        del self.__channelPointPositions[index]
 
     def anchorPoints(self):
         # type: () -> List[AnchorPoint]
@@ -722,9 +748,8 @@ class NodeAnchorItem(GraphicsPathObject):
         """
         Set the anchor positions in percentages (0..1) along the path curve.
         """
-        if self.__pointPositions != positions:
-            self.__pointPositions = list(positions)
-
+        if self.__uniformPointPositions != positions:
+            self.__uniformPointPositions = list(positions)
             self.__updatePositions()
 
     def anchorPositions(self):
@@ -734,7 +759,7 @@ class NodeAnchorItem(GraphicsPathObject):
         each float is between 0 and 1 and specifies where along the anchor
         path does the point lie (0 is at start 1 is at the end).
         """
-        return list(self.__pointPositions)
+        return list(self.__uniformPointPositions)
 
     def shape(self):
         # type: () -> QPainterPath
@@ -771,11 +796,30 @@ class NodeAnchorItem(GraphicsPathObject):
         if self.__animationEnabled != enabled:
             self.__animationEnabled = enabled
 
+    def signalAtPos(self, scenePos):
+        pos = self.mapFromScene(scenePos)
+
+        def signalLengthToPos(s):
+            perc = self.__getChannelPercent(s)
+            p = self.__anchorPath.pointAtPercent(perc)
+            return (p - pos).manhattanLength()
+
+        return min(self.__signals, key=signalLengthToPos)
+
     def __updateHoverState(self):
         self.__updateShadowState()
+        self.__updatePositions(animate=True)
 
         for indicator in self.anchorPoints():
             indicator.setHoverState(self.__hover)
+
+    def __getChannelPercent(self, signal):
+        signals = self.__signals
+
+        ci = signals.index(signal)
+        gap_perc = 1 / 8
+        seg_perc = (1 - (gap_perc * (len(signals) - 1))) / len(signals)
+        return (ci * (gap_perc + seg_perc)) + seg_perc / 2
 
     def __updateShadowState(self):
         # type: () -> None
@@ -794,13 +838,29 @@ class NodeAnchorItem(GraphicsPathObject):
         else:
             self.shadow.setBlurRadius(radius)
 
-    def __updatePositions(self):
-        # type: () -> None
+    def __updatePositions(self, animate=False):
+        # type: (Optional[bool]) -> None
         """Update anchor points positions.
         """
-        for point, t in zip(self.__points, self.__pointPositions):
-            pos = self.__anchorPath.pointAtPercent(t)
-            point.setPos(pos)
+        target = self.__channelPointPositions if self.__hover \
+                 else self.__uniformPointPositions
+        if self.animGroup.state() == QPropertyAnimation.Running:
+            if self.__lastSetPointPositions == target:
+                return
+            else:
+                self.animGroup.stop()
+        if animate:
+            for a, t in zip(self.__points, target):
+                currPos = a.pos()
+                a.anim.setStartValue(currPos)
+                pos = self.__anchorPath.pointAtPercent(t)
+                a.anim.setEndValue(pos)
+            self.animGroup.start()
+        else:
+            for point, t in zip(self.__points, target):
+                pos = self.__anchorPath.pointAtPercent(t)
+                point.setPos(pos)
+        self.__lastSetPointPositions = target
 
     def __on_finished(self):
         # type: () -> None
@@ -1085,8 +1145,10 @@ class NodeItem(QGraphicsWidget):
             self.setTitle(desc.name)
 
         if desc.inputs:
+            self.inputAnchorItem.setSignals(desc.inputs)
             self.inputAnchorItem.show()
         if desc.outputs:
+            self.outputAnchorItem.setSignals(desc.outputs)
             self.outputAnchorItem.show()
 
         tooltip = NodeItem_toolTipHelper(self)
@@ -1256,8 +1318,8 @@ class NodeItem(QGraphicsWidget):
             self.__info = message
             self.__updateMessages()
 
-    def newInputAnchor(self):
-        # type: () -> AnchorPoint
+    def newInputAnchor(self, signal):
+        # type: (InputSignal) -> AnchorPoint
         """
         Create and return a new input :class:`AnchorPoint`.
         """
@@ -1265,6 +1327,7 @@ class NodeItem(QGraphicsWidget):
             raise ValueError("Widget has no inputs.")
 
         anchor = AnchorPoint(self)
+        anchor.channel = signal
         self.inputAnchorItem.addAnchor(anchor)
 
         return anchor
@@ -1276,8 +1339,8 @@ class NodeItem(QGraphicsWidget):
         """
         self.inputAnchorItem.removeAnchor(anchor)
 
-    def newOutputAnchor(self):
-        # type: () -> AnchorPoint
+    def newOutputAnchor(self, signal):
+        # type: (OutputSignal) -> AnchorPoint
         """
         Create and return a new output :class:`AnchorPoint`.
         """
@@ -1285,6 +1348,7 @@ class NodeItem(QGraphicsWidget):
             raise ValueError("Widget has no outputs.")
 
         anchor = AnchorPoint(self)
+        anchor.channel = signal
         self.outputAnchorItem.addAnchor(anchor)
 
         return anchor
