@@ -597,6 +597,9 @@ class NodeAnchorItem(GraphicsPathObject):
         self.__animationEnabled = False
         self.__hover = False
 
+        # Is a temporary link connected to this anchor
+        self.connecting = False
+
         # Does this item have any anchored links.
         self.anchored = False
 
@@ -751,12 +754,16 @@ class NodeAnchorItem(GraphicsPathObject):
         """
         self.anchored = anchored
         if anchored:
-            self.shadow.setEnabled(False)
             self.setBrush(self.connectedBrush)
         else:
             brush = self.normalHoverBrush if self.__hover else self.normalBrush
             self.setBrush(brush)
         self.__updatePositions()
+
+    def setConnecting(self, connecting):
+        if self.connecting != connecting:
+            self.connecting = connecting
+            self.__updatePositions(animate=not connecting)
 
     def setConnectionHint(self, hint=None):
         """
@@ -984,7 +991,7 @@ class NodeAnchorItem(GraphicsPathObject):
         """
         target = self.__channelPointPositions if self.__hover or self.connecting \
                  else self.__uniformPointPositions
-        if self.__hover:
+        if self.__hover or self.connecting:
             endDash = self.__channelDash
         elif self.anchored:
             endDash = self.__anchoredDash
@@ -992,6 +999,7 @@ class NodeAnchorItem(GraphicsPathObject):
             endDash = self.__unanchoredDash
         if self.animGroup.state() == QPropertyAnimation.Running:
             if self.__lastSetPointPositions == target:
+                # TODO fix a bug where flicking on and off quick makes it the wrong dash line
                 return
             else:
                 self.animGroup.stop()

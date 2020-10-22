@@ -296,9 +296,26 @@ class NewLinkAction(UserInteraction):
         assert self.tmp_anchor_point is not None
         if self.direction == self.FROM_SOURCE:
             self.current_target_item.removeInputAnchor(self.tmp_anchor_point)
+            self.current_target_item.inputAnchorItem.setConnecting(False)
         else:
             self.current_target_item.removeOutputAnchor(self.tmp_anchor_point)
+            self.current_target_item.outputAnchorItem.setConnecting(False)
         self.tmp_anchor_point = None
+
+    def update_tmp_anchor(self, item, scenePos):
+        assert self.tmp_anchor_point is not None
+        if self.direction == self.FROM_SOURCE:
+            signal = item.inputAnchorItem.signalAtPos(scenePos)
+        else:
+            signal = item.outputAnchorItem.signalAtPos(scenePos)
+        if signal.name == self.tmp_anchor_point.channel:
+            # we good
+            return
+        self.remove_tmp_anchor()
+        self.create_tmp_anchor(item, scenePos)
+        self.set_link_target_anchor(
+            assert_not_none(self.tmp_anchor_point)
+        )
 
     def create_tmp_anchor(self, item, scenePos):
         # type: (items.NodeItem, QPointF) -> None
@@ -309,9 +326,11 @@ class NewLinkAction(UserInteraction):
         if self.direction == self.FROM_SOURCE:
             signal = item.inputAnchorItem.signalAtPos(scenePos)
             self.tmp_anchor_point = item.newInputAnchor(signal)
+            item.inputAnchorItem.setConnecting(True)
         else:
             signal = item.outputAnchorItem.signalAtPos(scenePos)
             self.tmp_anchor_point = item.newOutputAnchor(signal)
+            item.outputAnchorItem.setConnecting(True)
 
     def can_connect(self, target_item):
         # type: (items.NodeItem) -> bool
@@ -411,9 +430,11 @@ class NewLinkAction(UserInteraction):
             if self.direction == self.FROM_SOURCE:
                 signal = self.source_item.outputAnchorItem.signalAtPos(scenePos)
                 self.tmp_link_item.setSourceItem(self.source_item, signal)
+                self.source_item.outputAnchorItem.setConnecting(True)
             else:
                 signal = self.sink_item.inputAnchorItem.signalAtPos(scenePos)
                 self.tmp_link_item.setSinkItem(self.sink_item, signal)
+                self.source_item.outputAnchorItem.setConnecting(True)
 
             self.set_link_target_anchor(self.cursor_anchor_point)
             self.scene.addItem(self.tmp_link_item)
@@ -435,8 +456,9 @@ class NewLinkAction(UserInteraction):
         if item is not None and item is not self.from_item:
             # The mouse is over an node item (different from the starting node)
             if self.current_target_item is item:
-                # Avoid reseting the points
-                pass
+                # Move to new potential anchor
+                scenePos = event.scenePos()
+                self.update_tmp_anchor(item, scenePos)
             elif self.can_connect(item):
                 # Grab a new anchor
                 log.info("%r is the new target.", item)
@@ -726,6 +748,10 @@ class NewLinkAction(UserInteraction):
         self.macro = None
         helpevent = QuickHelpTipEvent("", "")
         QCoreApplication.postEvent(self.document, helpevent)
+        if self.sink_item:
+            self.sink_item.inputAnchorItem.setConnecting(False)
+        if self.source_item:
+            self.source_item.outputAnchorItem.setConnecting(False)
         super().end()
 
     def cancel(self, reason=UserInteraction.OtherReason):
